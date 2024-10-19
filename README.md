@@ -4,6 +4,8 @@ This project is a FastAPI application that allows users to upload images, apply 
 
 Completed as a solution to roadmapsh image processing project - https://roadmap.sh/projects/image-processing-service
 
+Next steps for this are to add rate limiting and a cache for transformed images. 
+
 ## Features
 
 - User registration and authentication
