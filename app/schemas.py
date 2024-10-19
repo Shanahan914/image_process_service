@@ -57,7 +57,6 @@ class Transformations(BaseModel):
     resize: Resize | None = None
     crop: Crop | None = None
     rotate: int | None = None
-    format: str | None = None
     filters: Filters | None = None
 
 class ImageTransformationsRequest(BaseModel):

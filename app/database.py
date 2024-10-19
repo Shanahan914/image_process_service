@@ -3,9 +3,10 @@ from sqlmodel import Session, SQLModel, create_engine
 from typing import Annotated
 from fastapi import Depends
 
+
 owner = config('OWNER')
 password = config('PG_PASSWORD')
-POSTGRES_DATABASE_URL = f'postgresql://{owner}:{password}@localhost/image_processing'
+POSTGRES_DATABASE_URL = f'postgresql://{owner}:{password}@db:5432/image_processing'
 engine = create_engine(POSTGRES_DATABASE_URL)
 
 
@@ -29,6 +30,3 @@ def get_session():
 # we will add this to routes. 
 SessionDep = Annotated[Session, Depends(get_session)]
 
-
-# runs the create the table creation func on startup
-# TODO explore Alembic

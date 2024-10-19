@@ -9,17 +9,32 @@ from .schemas import  Token, UserPublic, UserInput, PhotoPublic, ImageTransforma
 from .models import User, Photo
 from .auth import get_password_hash, authenticate_user, create_access_token, get_current_user
 from .tasks import generate_unique_filename
+from .rabbitmq_publisher import send_transformation_task
 import boto3
 from decouple import config
 from PIL import Image, ImageOps
 import io
+import logging
+from fastapi_limiter.depends import RateLimiter
 
 router = APIRouter()
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 
 BUCKET_NAME = config('BUCKET_NAME')
+REGION = config('REGION')
+AWS_SECRET = config('AWS_SECRET')
+AWS_PUBLIC = config('AWS_PUBLIC')
 
-s3 = boto3.client('s3')
+s3 = boto3.client('s3', region_name = REGION, aws_secret_access_key = AWS_SECRET, aws_access_key_id=AWS_PUBLIC)
+
+# initialize logger 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# error handler and logger
+def log_and_raise_error(message: str, status_code: int = 500):
+    logger.error(message)
+    raise HTTPException(status_code=status_code, detail=message)
 
 # /token 
 # POST
@@ -47,10 +62,10 @@ async def login_for_access_token(
 # /users 
 # GET
 # login endpoint
-@router.get("/users/")
-def get_db(session: SessionDep) -> List[UserPublic]:
-    data = session.exec(select(User)).all()
-    return data
+# @router.get("/users/")
+# def get_db(session: SessionDep,) -> List[UserPublic]:
+#     data = session.exec(select(User)).all()
+#     return data
 
 
 # /users 
@@ -59,14 +74,21 @@ def get_db(session: SessionDep) -> List[UserPublic]:
 @router.post("/users/")
 def create_user(user: UserInput, session: SessionDep) -> UserPublic:
     #get hashed password
-    hashed_password = get_password_hash(user.plain_password)
+    try:
+        hashed_password = get_password_hash(user.plain_password)
+    except Exception as e:
+        log_and_raise_error(f"Error hashing password: {e}", 400)
+    
     #create new User instance
-    new_user = User(email = user.email, hashed_password=hashed_password)
-    #add to db and commit
-    session.add(new_user)
-    session.commit()
-    session.refresh(new_user)
-    return new_user
+    try: 
+        new_user = User(email = user.email, hashed_password=hashed_password)
+        #add to db and commit
+        session.add(new_user)
+        session.commit()
+        session.refresh(new_user)
+        return new_user
+    except Exception as e:
+        log_and_raise_error(f"Error adding user to db: {e}", 400)
 
 
 # get current user - test route
@@ -90,14 +112,17 @@ async def create_upload_file(file: UploadFile,
         s3_uri = generate_unique_filename(file.filename)
         s3.upload_fileobj(file.file, BUCKET_NAME, s3_uri)
     except Exception as e:
-        print(f'error when uploading to s3:{e} ')
+        log_and_raise_error(f"error uploading image to cloud: {e}", 500)
 
     # save to Photo table
-    new_image = Photo(filename=file.filename, user_id = current_user.id, s3_uri = s3_uri)
-    session.add(new_image)
-    session.commit()
-    session.refresh(new_image)
-    return new_image
+    try:
+        new_image = Photo(filename=file.filename, user_id = current_user.id, s3_uri = s3_uri)
+        session.add(new_image)
+        session.commit()
+        session.refresh(new_image)
+        return new_image
+    except Exception as e:
+        log_and_raise_error(f"Error saving image metadata to db: {e}", 500)
 
 
 # /images 
@@ -106,9 +131,18 @@ async def create_upload_file(file: UploadFile,
 @router.get("/images")
 async def list_of_images(
             current_user: Annotated[User, Depends(get_current_user)],
-            session: SessionDep) -> List[PhotoPublic]:
-    photos = session.exec(select(Photo).where(Photo.user_id == current_user.id))
-    return photos
+            session: SessionDep,
+            skip: int = Query(0, ge=0), # skip and limit for pagination
+            limit: int = Query(10, ge=1),
+            q: str = Query(None, description='search filename including extension')) -> List[PhotoPublic]:
+    try:
+        query_selection = select(Photo).where(Photo.user_id == current_user.id)
+        if q:
+            query_selection =  query_selection.where(Photo.filename.ilike(f"%{q}%"))
+        photos = session.exec(query_selection.offset(skip).limit(limit)).all()
+        return photos
+    except Exception as e:
+        log_and_raise_error(f"Error retreiving metadata of the images: {e}")
 
 
 # /images/id/transform POST
@@ -116,62 +150,58 @@ async def list_of_images(
 #helper function
 def get_image_from_s3(object_key: str) -> Image.Image:
     # Retrieve the image from S3
-    response = s3.get_object(Bucket=BUCKET_NAME, Key=object_key)
-    image_data = response['Body'].read()  # Read the image data
-
-    # Use BytesIO to load image with Pillow
-    image = Image.open(io.BytesIO(image_data))
-    return image
-
-async def alter_image(im, img_request):
-    print('now lets transform')
-    transformation_dict = img_request.model_dump()
-    transformations = transformation_dict['transformations']
-    print(transformations)
-    if transformations['resize'] is not None:
-        width = transformations['resize']['width']
-        height = transformations['resize']['height']
-        im = im.resize((width, height))
-    if transformations['crop'] is not None:
-        width = transformations['crop']['width']
-        height = transformations['crop']['height']
-        x = transformations['crop']['x']
-        y = transformations['crop']['y']
-        im = im.crop(( x, y, x + width, y + height))
-    if transformations['filters'] is not None:
-        if transformations['filters']["grayscale"] == True:
-            im = ImageOps.grayscale(im)
-    if transformations['rotate'] is not None:
-        degree = transformations['rotate']
-        im = im.rotate(degree)
-    if transformations['format'] is not None:
-        format = transformations['format']
-        im = im.save(im, format)
-    return im
-
+    try:
+        response = s3.get_object(Bucket=BUCKET_NAME, Key=object_key)
+        image_data = response['Body'].read()  # Read the image data
+        image = Image.open(io.BytesIO(image_data))
+        return image
+    except Exception as e:
+        log_and_raise_error(f"Error retreiving image from cloud: {e}")
+    
+# route
 @router.post("/images/{image_id}/transform")
 async def transform_image(image_id: int, 
                         img_request: ImageTransformationsRequest,
-                        session: SessionDep) -> PhotoPublic:
-    print('transform incoming')
+                        session: SessionDep,
+                        current_user: Annotated[User, Depends(get_current_user)]) -> PhotoPublic:
     # get image metadata from db
-    image_table_data = session.get(Photo, image_id)
-    # get image from s3
-    im = get_image_from_s3(image_table_data.s3_uri)
+    try:
+        image_table_data = session.get(Photo, image_id)
+    except Exception as e:
+        log_and_raise_error(f"Error retreiving metadata of the image: {e}")
+    if image_table_data.user_id != current_user.id:
+        log_and_raise_error(f"You are not authorised to access this object", 403)
     # make the transformations
-    new_im = await alter_image(im, img_request)
+    try:
+        transformation_dict = img_request.model_dump()
+        send_transformation_task(image_id, transformation_dict, image_table_data.s3_uri)
+    except Exception as e:
+        log_and_raise_error(f"Error when transforming image. Logged from routes: {e}")
     # update metadata
-    image_table_data.version = 2
-    session.add(image_table_data)
-    session.commit()
-    session.refresh(image_table_data)
-    return image_table_data
-
+    try:
+        image_table_data.version = int( image_table_data.version) +1
+        session.add(image_table_data)
+        session.commit()
+        session.refresh(image_table_data)
+        return image_table_data
+    except Exception as e:
+        log_and_raise_error(f"Error saving image metadata to db: {e}", 500)
+    
 
 # /images/id GET
 @router.get("/image/{image_id}")
-async def get_image(image_id: int, session: SessionDep):
-    image_table_data = session.get(Photo, image_id)
-    s3_object = s3.get_object(Bucket=BUCKET_NAME, Key=image_table_data.s3_uri)
+async def get_image(image_id: int, 
+                    session: SessionDep,
+                    current_user: Annotated[User, Depends(get_current_user)]):
+    try:
+        image_table_data = session.get(Photo, image_id)
+    except Exception as e:
+        log_and_raise_error(f"Error retreiving metadata of the image: {e}")
+    if image_table_data.user_id != current_user.id:
+        log_and_raise_error(f"You are not authorised to access this object", 403)
+    try:
+        s3_object = s3.get_object(Bucket=BUCKET_NAME, Key=image_table_data.s3_uri)
+    except Exception as e:
+        log_and_raise_error(f"Error retreiving image from cloud: {e}", 500)
     return StreamingResponse(s3_object['Body'], media_type="image/jpeg")
 
