@@ -15,7 +15,6 @@ from decouple import config
 from PIL import Image, ImageOps
 import io
 import logging
-from fastapi_limiter.depends import RateLimiter
 
 router = APIRouter()
 
