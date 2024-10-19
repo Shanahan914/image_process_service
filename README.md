@@ -21,6 +21,7 @@ Next steps for this are to add rate limiting and a cache for transformed images.
 - PostgreSQL
 - RabbitMQ
 - Boto3 (for AWS S3 integration)
+- Docker
 
 ## Installation
 
